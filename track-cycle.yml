@@ -1,0 +1,190 @@
+name: Forkable Track Cycle
+
+# 1. "seed" — once a day: bot generates a new raw track, commits stems to the repo,
+#    mints it on Base as a seed NFT, opens an Issue inviting forks/remixes.
+# 2. "close-voting" — once a day (offset from seed): closes the previous day's voting
+#    window, tallies reactions on remix PRs, mints the winning remix(es) as child NFTs.
+
+on:
+  schedule:
+    - cron: "0 12 * * *"   # 12:00 UTC — publish new seed track
+    - cron: "0 12 * * *"   # (offset in practice, e.g. run close-voting at 11:55 the next cycle)
+  pull_request:
+    types: [opened, synchronize]
+    paths:
+      - "remixes/**"
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "seed or close-voting"
+        required: true
+        default: "seed"
+
+jobs:
+  seed:
+    if: github.event.inputs.action == 'seed' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm ci --prefix scripts
+
+      - name: Generate today's seed track
+        env:
+          MUSIC_API_KEY: ${{ secrets.MUSIC_API_KEY }}
+        run: node scripts/generate-seed.js
+
+      - name: Upload stems + full mix to IPFS
+        id: ipfs
+        env:
+          WEB3_STORAGE_TOKEN: ${{ secrets.WEB3_STORAGE_TOKEN }}
+        run: node scripts/upload-ipfs.js --path ./tracks/latest
+
+      - name: Mint seed NFT on Base
+        id: mint
+        env:
+          BASE_RPC_URL: ${{ secrets.BASE_RPC_URL }}
+          ORACLE_PRIVATE_KEY: ${{ secrets.ORACLE_PRIVATE_KEY }}
+          CONTRACT_ADDRESS: ${{ secrets.FORKABLETRACK_CONTRACT_ADDRESS }}
+          LABEL_TREASURY_ADDRESS: ${{ secrets.LABEL_TREASURY_ADDRESS }}
+        run: node scripts/mint-seed.js --metadataURI "${{ steps.ipfs.outputs.uri }}"
+
+      - name: Persist track under permanent seed folder
+        run: |
+          SEED_DIR="tracks/seed-${{ steps.mint.outputs.tokenId }}"
+          cp -r tracks/latest "$SEED_DIR"
+          node -e "
+            const fs = require('fs');
+            const p = '$SEED_DIR/meta.json';
+            const meta = JSON.parse(fs.readFileSync(p, 'utf8'));
+            meta.tokenId = '${{ steps.mint.outputs.tokenId }}';
+            meta.ipfsUri = '${{ steps.ipfs.outputs.uri }}';
+            fs.writeFileSync(p, JSON.stringify(meta, null, 2));
+          "
+
+      - name: Generate listen page
+        id: page
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          node scripts/generate-listen-page.js \
+            --seedId "${{ steps.mint.outputs.tokenId }}" \
+            --seedURI "${{ steps.ipfs.outputs.uri }}" \
+            --seedMeta "$(cat tracks/seed-${{ steps.mint.outputs.tokenId }}/meta.json)"
+
+      - name: Commit track + listen page to repo
+        run: |
+          git config user.name "forkbot"
+          git config user.email "bot@forkabletrack.local"
+          git add tracks/ docs/
+          git commit -m "Seed track #${{ steps.mint.outputs.tokenId }}"
+          git push
+
+      - name: Open remix Issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Seed #${{ steps.mint.outputs.tokenId }} — fork it, remix it`,
+              body: [
+                `🎧 Listen: ${{ steps.page.outputs.pageUrl }}`,
+                `Raw files: ${{ steps.ipfs.outputs.uri }}`,
+                ``,
+                `Fork this repo, drop your remix into \`remixes/seed-${{ steps.mint.outputs.tokenId }}/<your-handle>/mix.wav\`, open a PR.`,
+                `Your remix will appear on the listen page automatically once the PR is open.`,
+                `React 👍 on PRs you like — voting closes in 24h.`,
+                `Winning remix gets minted as an NFT on Base, linked to this seed, with royalties split back to the original.`
+              ].join("\n"),
+              labels: ["seed", "voting-open"]
+            });
+
+  refresh-listen-page:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main   # rebuild the page on the default branch, not the PR branch
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm ci --prefix scripts
+
+      - name: Extract seedId from PR path
+        id: seed
+        run: |
+          SEED_ID=$(echo "${{ github.event.pull_request.title }}" | grep -oP 'seed-\K\d+' || true)
+          echo "seedId=$SEED_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Rebuild listen page
+        if: steps.seed.outputs.seedId != ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node scripts/generate-listen-page.js --seedId "${{ steps.seed.outputs.seedId }}"
+
+      - name: Commit updated page
+        if: steps.seed.outputs.seedId != ''
+        run: |
+          git config user.name "forkbot"
+          git config user.email "bot@forkabletrack.local"
+          git add docs/
+          git diff --staged --quiet || (git commit -m "Refresh listen page for seed #${{ steps.seed.outputs.seedId }}" && git push)
+
+  close-voting:
+    if: github.event.inputs.action == 'close-voting'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm ci --prefix scripts
+
+      - name: Tally PR reactions, pick winner(s)
+        id: tally
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node scripts/tally-votes.js
+
+      - name: Upload winning remix to IPFS
+        id: ipfs
+        if: steps.tally.outputs.winnerPath != ''
+        env:
+          WEB3_STORAGE_TOKEN: ${{ secrets.WEB3_STORAGE_TOKEN }}
+        run: node scripts/upload-ipfs.js --path "${{ steps.tally.outputs.winnerPath }}"
+
+      - name: Mint winning remix on Base
+        if: steps.tally.outputs.winnerPath != ''
+        env:
+          BASE_RPC_URL: ${{ secrets.BASE_RPC_URL }}
+          ORACLE_PRIVATE_KEY: ${{ secrets.ORACLE_PRIVATE_KEY }}
+          CONTRACT_ADDRESS: ${{ secrets.FORKABLETRACK_CONTRACT_ADDRESS }}
+        run: |
+          node scripts/mint-remix.js \
+            --parentId "${{ steps.tally.outputs.parentId }}" \
+            --remixer "${{ steps.tally.outputs.remixerWallet }}" \
+            --metadataURI "${{ steps.ipfs.outputs.uri }}"
+
+      - name: Mark winner on listen page
+        if: steps.tally.outputs.winnerPath != ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          node scripts/generate-listen-page.js \
+            --seedId "${{ steps.tally.outputs.parentId }}" \
+            --winnerPRNumber "${{ steps.tally.outputs.winnerPRNumber }}"
+          git config user.name "forkbot"
+          git config user.email "bot@forkabletrack.local"
+          git add docs/
+          git diff --staged --quiet || (git commit -m "Mark winner for seed #${{ steps.tally.outputs.parentId }}" && git push)
+
+      - name: Announce winner, close voting Issue
+        if: steps.tally.outputs.winnerPath != ''
+        run: |
+          node scripts/announce-winner.js \
+            --issueNumber "${{ steps.tally.outputs.issueNumber }}" \
+            --pageUrl "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/seed-${{ steps.tally.outputs.parentId }}/"
